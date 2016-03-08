@@ -19,8 +19,6 @@ package org.apache.spark.sql.execution.datasources
 
 import java.util.{Date, UUID}
 
-import scala.collection.JavaConverters._
-
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.mapreduce._
 import org.apache.hadoop.mapreduce.lib.output.{FileOutputCommitter => MapReduceFileOutputCommitter}
@@ -28,17 +26,26 @@ import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
 
 import org.apache.spark._
 import org.apache.spark.mapred.SparkHadoopMapRedUtil
-import org.apache.spark.sql._
+import org.apache.spark.sql.SQLContext
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.UnsafeKVExternalSorter
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.{HadoopFsRelation, OutputWriter, OutputWriterFactory}
 import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
 import org.apache.spark.util.SerializableConfiguration
 
+/** A container for all the details required when writing to a table. */
+case class WriteRelation(
+    sqlContext: SQLContext,
+    dataSchema: StructType,
+    path: String,
+    prepareJobForWrite: Job => OutputWriterFactory,
+    bucketSpec: Option[BucketSpec])
 
 private[sql] abstract class BaseWriterContainer(
-    @transient val relation: HadoopFsRelation,
+    @transient val relation: WriteRelation,
     @transient private val job: Job,
     isAppend: Boolean)
   extends Logging with Serializable {
@@ -68,12 +75,7 @@ private[sql] abstract class BaseWriterContainer(
   @transient private var taskAttemptId: TaskAttemptID = _
   @transient protected var taskAttemptContext: TaskAttemptContext = _
 
-  protected val outputPath: String = {
-    assert(
-      relation.paths.length == 1,
-      s"Cannot write to multiple destinations: ${relation.paths.mkString(",")}")
-    relation.paths.head
-  }
+  protected val outputPath: String = relation.path
 
   protected var outputWriterFactory: OutputWriterFactory = _
 
@@ -146,7 +148,7 @@ private[sql] abstract class BaseWriterContainer(
       // If we are appending data to an existing dir, we will only use the output committer
       // associated with the file output format since it is not safe to use a custom
       // committer for appending. For example, in S3, direct parquet output committer may
-      // leave partial data in the destination dir when the the appending job fails.
+      // leave partial data in the destination dir when the appending job fails.
       //
       // See SPARK-8578 for more details
       logInfo(
@@ -238,7 +240,7 @@ private[sql] abstract class BaseWriterContainer(
  * A writer that writes all of the rows in a partition to a single file.
  */
 private[sql] class DefaultWriterContainer(
-    relation: HadoopFsRelation,
+    relation: WriteRelation,
     job: Job,
     isAppend: Boolean)
   extends BaseWriterContainer(relation, job, isAppend) {
@@ -247,10 +249,8 @@ private[sql] class DefaultWriterContainer(
     executorSideSetup(taskContext)
     val configuration = taskAttemptContext.getConfiguration
     configuration.set("spark.sql.sources.output.path", outputPath)
-    val writer = newOutputWriter(getWorkPath)
+    var writer = newOutputWriter(getWorkPath)
     writer.initConverter(dataSchema)
-
-    var writerClosed = false
 
     // If anything below fails, we should abort the task.
     try {
@@ -263,16 +263,17 @@ private[sql] class DefaultWriterContainer(
     } catch {
       case cause: Throwable =>
         logError("Aborting task.", cause)
+        // call failure callbacks first, so we could have a chance to cleanup the writer.
+        TaskContext.get().asInstanceOf[TaskContextImpl].markTaskFailed(cause)
         abortTask()
         throw new SparkException("Task failed while writing rows.", cause)
     }
 
     def commitTask(): Unit = {
       try {
-        assert(writer != null, "OutputWriter instance should have been initialized")
-        if (!writerClosed) {
+        if (writer != null) {
           writer.close()
-          writerClosed = true
+          writer = null
         }
         super.commitTask()
       } catch {
@@ -285,9 +286,8 @@ private[sql] class DefaultWriterContainer(
 
     def abortTask(): Unit = {
       try {
-        if (!writerClosed) {
+        if (writer != null) {
           writer.close()
-          writerClosed = true
         }
       } finally {
         super.abortTask()
@@ -302,7 +302,7 @@ private[sql] class DefaultWriterContainer(
  * writer externally sorts the remaining rows and then writes out them out one file at a time.
  */
 private[sql] class DynamicPartitionWriterContainer(
-    relation: HadoopFsRelation,
+    relation: WriteRelation,
     job: Job,
     partitionColumns: Seq[Attribute],
     dataColumns: Seq[Attribute],
@@ -322,9 +322,12 @@ private[sql] class DynamicPartitionWriterContainer(
     spec => spec.sortColumnNames.map(c => inputSchema.find(_.name == c).get)
   }
 
-  private def bucketIdExpression: Option[Expression] = for {
-    BucketSpec(numBuckets, _, _) <- bucketSpec
-  } yield Pmod(new Murmur3Hash(bucketColumns), Literal(numBuckets))
+  private def bucketIdExpression: Option[Expression] = bucketSpec.map { spec =>
+    // Use `HashPartitioning.partitionIdExpression` as our bucket id expression, so that we can
+    // guarantee the data distribution is same between shuffle and bucketed data source, which
+    // enables us to only shuffle one side when join a bucketed table and a normal one.
+    HashPartitioning(bucketColumns, spec.numBuckets).partitionIdExpression
+  }
 
   // Expressions that given a partition key build a string like: col1=val/col2=val/...
   private def partitionStringExpression: Seq[Expression] = {
@@ -341,12 +344,8 @@ private[sql] class DynamicPartitionWriterContainer(
     }
   }
 
-  private def getBucketIdFromKey(key: InternalRow): Option[Int] = {
-    if (bucketSpec.isDefined) {
-      Some(key.getInt(partitionColumns.length))
-    } else {
-      None
-    }
+  private def getBucketIdFromKey(key: InternalRow): Option[Int] = bucketSpec.map { _ =>
+    key.getInt(partitionColumns.length)
   }
 
   /**
@@ -378,7 +377,6 @@ private[sql] class DynamicPartitionWriterContainer(
 
     // We should first sort by partition columns, then bucket id, and finally sorting columns.
     val sortingExpressions: Seq[Expression] = partitionColumns ++ bucketIdExpression ++ sortColumns
-
     val getSortingKey = UnsafeProjection.create(sortingExpressions, inputSchema)
 
     val sortingKeySchema = StructType(sortingExpressions.map {
@@ -394,57 +392,62 @@ private[sql] class DynamicPartitionWriterContainer(
     val getPartitionString =
       UnsafeProjection.create(Concat(partitionStringExpression) :: Nil, partitionColumns)
 
+    // Sorts the data before write, so that we only need one writer at the same time.
+    // TODO: inject a local sort operator in planning.
+    val sorter = new UnsafeKVExternalSorter(
+      sortingKeySchema,
+      StructType.fromAttributes(dataColumns),
+      SparkEnv.get.blockManager,
+      TaskContext.get().taskMemoryManager().pageSizeBytes)
+
+    while (iterator.hasNext) {
+      val currentRow = iterator.next()
+      sorter.insertKV(getSortingKey(currentRow), getOutputRow(currentRow))
+    }
+    logInfo(s"Sorting complete. Writing out partition files one at a time.")
+
+    val getBucketingKey: InternalRow => InternalRow = if (sortColumns.isEmpty) {
+      identity
+    } else {
+      UnsafeProjection.create(sortingExpressions.dropRight(sortColumns.length).zipWithIndex.map {
+        case (expr, ordinal) => BoundReference(ordinal, expr.dataType, expr.nullable)
+      })
+    }
+
+    val sortedIterator = sorter.sortedIterator()
+
     // If anything below fails, we should abort the task.
+    var currentWriter: OutputWriter = null
     try {
-      // Sorts the data before write, so that we only need one writer at the same time.
-      // TODO: inject a local sort operator in planning.
-      val sorter = new UnsafeKVExternalSorter(
-        sortingKeySchema,
-        StructType.fromAttributes(dataColumns),
-        SparkEnv.get.blockManager,
-        TaskContext.get().taskMemoryManager().pageSizeBytes)
-
-      while (iterator.hasNext) {
-        val currentRow = iterator.next()
-        sorter.insertKV(getSortingKey(currentRow), getOutputRow(currentRow))
-      }
-
-      logInfo(s"Sorting complete. Writing out partition files one at a time.")
-
-      val getBucketingKey: InternalRow => InternalRow = if (sortColumns.isEmpty) {
-        identity
-      } else {
-        UnsafeProjection.create(sortingExpressions.dropRight(sortColumns.length).zipWithIndex.map {
-          case (expr, ordinal) => BoundReference(ordinal, expr.dataType, expr.nullable)
-        })
-      }
-
-      val sortedIterator = sorter.sortedIterator()
       var currentKey: UnsafeRow = null
-      var currentWriter: OutputWriter = null
-      try {
-        while (sortedIterator.next()) {
-          val nextKey = getBucketingKey(sortedIterator.getKey).asInstanceOf[UnsafeRow]
-          if (currentKey != nextKey) {
-            if (currentWriter != null) {
-              currentWriter.close()
-            }
-            currentKey = nextKey.copy()
-            logDebug(s"Writing partition: $currentKey")
-
-            currentWriter = newOutputWriter(currentKey, getPartitionString)
+      while (sortedIterator.next()) {
+        val nextKey = getBucketingKey(sortedIterator.getKey).asInstanceOf[UnsafeRow]
+        if (currentKey != nextKey) {
+          if (currentWriter != null) {
+            currentWriter.close()
+            currentWriter = null
           }
+          currentKey = nextKey.copy()
+          logDebug(s"Writing partition: $currentKey")
 
-          currentWriter.writeInternal(sortedIterator.getValue)
+          currentWriter = newOutputWriter(currentKey, getPartitionString)
         }
-      } finally {
-        if (currentWriter != null) { currentWriter.close() }
+        currentWriter.writeInternal(sortedIterator.getValue)
+      }
+      if (currentWriter != null) {
+        currentWriter.close()
+        currentWriter = null
       }
 
       commitTask()
     } catch {
       case cause: Throwable =>
         logError("Aborting task.", cause)
+        // call failure callbacks first, so we could have a chance to cleanup the writer.
+        TaskContext.get().asInstanceOf[TaskContextImpl].markTaskFailed(cause)
+        if (currentWriter != null) {
+          currentWriter.close()
+        }
         abortTask()
         throw new SparkException("Task failed while writing rows.", cause)
     }
